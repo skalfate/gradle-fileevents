@@ -16,7 +16,8 @@ abstract class GitVersionExtension(
 
 val generateVersionFile by tasks.registering(GenerateVersions::class) {
     // Project version is set by the jgitver plugin
-    version = providers.provider { project.version.toString() }
+    //version = providers.provider { project.version.toString() }
+    version = providers.provider { "0.2.8" }
     javaOutputDir = layout.buildDirectory.dir("generated/sources/java/version")
     headerOutputDir = layout.buildDirectory.dir("generated/sources/headers/version")
 }
