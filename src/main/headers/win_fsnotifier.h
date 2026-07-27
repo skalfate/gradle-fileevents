@@ -142,7 +142,11 @@ protected:
     void shutdownRunLoop() override;
 
 private:
-    void handleEvent(JNIEnv* env, const wstring& watchedPath, FILE_NOTIFY_EXTENDED_INFORMATION* info);
+    // For Windows 10+ exclusively because of FILE_NOTIFY_EXTENDED_INFORMATION
+    //void handleEvent(JNIEnv* env, const wstring& watchedPath, FILE_NOTIFY_EXTENDED_INFORMATION* info);
+
+    // Universal handler that works on both Windows 7 and 10
+    void handleCommonEvent(JNIEnv* env, const wstring& watchedPathW, DWORD action, const wstring& relativePathW, bool isDirectory, bool hasAttributes);
 
     void registerPath(const u16string& path);
     bool unregisterPath(const u16string& path);

@@ -1,9 +1,46 @@
+#ifndef NTDDI_VERSION
+#define NTDDI_VERSION NTDDI_WIN7
+//#define _WIN32_WINNT  _WIN32_WINNT_WIN7
+#endif
+
 #ifdef _WIN32
 
 #include "win_fsnotifier.h"
 #include "command.h"
 
 #include <locale>
+
+// For Windows 7 SDK, this Windows 10 symbol is missing and must be defined to compile correctly
+#if (NTDDI_VERSION == NTDDI_WIN7)
+
+enum READ_DIRECTORY_NOTIFY_INFORMATION_CLASS {
+    ReadDirectoryNotifyInformation = 1,
+    ReadDirectoryNotifyExtendedInformation = 2
+};
+
+// This function pointer uses native Windows type name for Windows 10 Support
+typedef BOOL(WINAPI* PFN_ReadDirectoryChangesExW)(
+    HANDLE, LPVOID, DWORD, BOOL, DWORD, LPDWORD, LPOVERLAPPED,
+    LPOVERLAPPED_COMPLETION_ROUTINE, READ_DIRECTORY_NOTIFY_INFORMATION_CLASS
+);
+#endif
+
+#ifndef FILE_NOTIFY_CHANGE_LAST_ACCESS
+
+typedef struct _FILE_NOTIFY_EXTENDED_INFORMATION {
+    ULONG NextEntryOffset;
+    ULONG Action;
+    LARGE_INTEGER CreationTime;
+    LARGE_INTEGER LastModificationTime;
+    LARGE_INTEGER LastChangeTime;
+    LARGE_INTEGER LastAccessTime;
+    LARGE_INTEGER AllocatedLength;
+    LARGE_INTEGER FileSize;
+    ULONG FileAttributes;
+    ULONG FileNameLength;
+    WCHAR FileName[1];
+} FILE_NOTIFY_EXTENDED_INFORMATION, *PFILE_NOTIFY_EXTENDED_INFORMATION;
+#endif
 
 using namespace std;
 
@@ -51,7 +88,7 @@ bool isUncLongPath(const wstring& path) {
     return path.length() >= 8 && path.substr(0, 8) == L"\\\\?\\UNC\\";
 }
 
-// TODO How can this be done nicer, wihtout both unnecessary copy and in-place mutation?
+// TODO How can this be done nicer, without both unnecessary copy and in-place mutation?
 void convertToLongPathIfNeeded(wstring& path) {
     // Technically, this should be MAX_PATH (i.e. 260), except some Win32 API related
     // to working with directory paths are actually limited to 240. It is just
@@ -180,16 +217,39 @@ bool WatchPoint::isValidDirectory() {
 }
 
 ListenResult WatchPoint::listen() {
-    BOOL success = ReadDirectoryChangesExW(
-        directoryHandle,                   // handle to directory
-        &eventBuffer[0],                   // read results buffer
-        (DWORD) eventBuffer.capacity(),    // length of buffer
-        TRUE,                              // include children
-        EVENT_MASK,                        // filter conditions
-        NULL,                              // bytes returned
-        &overlapped,                       // overlapped buffer
-        &handleEventCallback,              // completion routine
-        ReadDirectoryNotifyExtendedInformation);
+    // Look up the Windows 10 API entry point at runtime
+    static PFN_ReadDirectoryChangesExW pfnReadDirectoryChangesExW =
+        (PFN_ReadDirectoryChangesExW)(void*)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "ReadDirectoryChangesExW");
+
+    BOOL success = FALSE;
+
+    if (pfnReadDirectoryChangesExW != nullptr) {
+        // WINDOWS 10 API PATH
+        success = pfnReadDirectoryChangesExW(
+            directoryHandle,                   // handle to directory
+            &eventBuffer[0],                   // read results buffer
+            (DWORD) eventBuffer.capacity(),    // length of buffer
+            TRUE,                              // include children
+            EVENT_MASK,                        // filter conditions
+            NULL,                              // bytes returned
+            &overlapped,                       // overlapped buffer
+            &handleEventCallback,              // completion routine
+            ReadDirectoryNotifyExtendedInformation // Request the modern layout
+        );
+    } else {
+        // WINDOWS 7 API BACKWARD-COMPATIBLE FALLBACK
+        success = ReadDirectoryChangesW(
+            directoryHandle,                   // handle to directory
+            &eventBuffer[0],                   // read results buffer
+            (DWORD) eventBuffer.capacity(),    // length of buffer
+            TRUE,                              // include children
+            EVENT_MASK,                        // filter conditions
+            NULL,                              // bytes returned
+            &overlapped,                       // overlapped buffer
+            &handleEventCallback              // completion routine
+        );
+    }
+
     if (success) {
         status = WatchPointStatus::LISTENING;
         return ListenResult::SUCCESS;
@@ -281,14 +341,35 @@ void Server::handleEvents(WatchPoint* watchPoint, DWORD errorCode, const vector<
             // We'll handle this as a simple overflow and report it as such.
             reportOverflow(env, wideToUtf16String(path));
         } else {
+            // Re-check operating system support scope to parse accurately
+            static bool isWindows10_OrNewer = (GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "ReadDirectoryChangesExW") != nullptr);
             int index = 0;
+
             for (;;) {
-                FILE_NOTIFY_EXTENDED_INFORMATION* current = (FILE_NOTIFY_EXTENDED_INFORMATION*) &eventBuffer[index];
-                handleEvent(env, path, current);
-                if (current->NextEntryOffset == 0) {
-                    break;
+                if (isWindows10_OrNewer) {
+                    // Parse using Windows 10 Payload Standards
+                    FILE_NOTIFY_EXTENDED_INFORMATION* currentEx = (FILE_NOTIFY_EXTENDED_INFORMATION*)&eventBuffer[index];
+
+                    // Construct local variables to pass to common processing routine
+                    wstring changedPathW = wstring(currentEx->FileName, currentEx->FileNameLength / sizeof(wchar_t));
+                    bool isDirectory = (currentEx->FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+
+                    handleCommonEvent(env, path, currentEx->Action, changedPathW, isDirectory, true);
+
+                    if (currentEx->NextEntryOffset == 0) {break;};
+                    index += currentEx->NextEntryOffset;
+                } else {
+                    // Parse using Windows 7 Payload Standards
+                    FILE_NOTIFY_INFORMATION* current7 = (FILE_NOTIFY_INFORMATION*)&eventBuffer[index];
+
+                    wstring changedPathW = wstring(current7->FileName, current7->FileNameLength / sizeof(wchar_t));
+
+                    // Windows 7 payload doesn't contain attribute metadata
+                    handleCommonEvent(env, path, current7->Action, changedPathW, false, false);
+
+                    if (current7->NextEntryOffset == 0) {break;};
+                    index += current7->NextEntryOffset;
                 }
-                index += current->NextEntryOffset;
             }
         }
 
@@ -305,29 +386,31 @@ void Server::handleEvents(WatchPoint* watchPoint, DWORD errorCode, const vector<
     }
 }
 
-void Server::handleEvent(JNIEnv* env, const wstring& watchedPathW, FILE_NOTIFY_EXTENDED_INFORMATION* info) {
-    wstring changedPathW = wstring(info->FileName, 0, info->FileNameLength / sizeof(wchar_t));
+// Universal Handle Event for Windows 7 and 10
+void Server::handleCommonEvent(JNIEnv* env, const wstring& watchedPathW, DWORD action, const wstring& relativePathW, bool isDirectory, bool hasAttributes) {
+    wstring changedPathW = relativePathW;
     if (!changedPathW.empty()) {
         changedPathW.insert(0, 1, L'\\');
     }
     changedPathW.insert(0, watchedPathW);
 
-    logToJava(LogLevel::TRACE_LEVEL, "Change detected: 0x%x '%s'", info->Action, wideToUtf8String(changedPathW).c_str());
+    logToJava(LogLevel::TRACE_LEVEL, "Change detected: 0x%x '%s'", action, wideToUtf8String(changedPathW).c_str());
 
     ChangeType type;
-    if (info->Action == FILE_ACTION_ADDED || info->Action == FILE_ACTION_RENAMED_NEW_NAME) {
+    if (action == FILE_ACTION_ADDED || action == FILE_ACTION_RENAMED_NEW_NAME) {
         type = ChangeType::CREATED;
-    } else if (info->Action == FILE_ACTION_REMOVED || info->Action == FILE_ACTION_RENAMED_OLD_NAME) {
+    } else if (action == FILE_ACTION_REMOVED || action == FILE_ACTION_RENAMED_OLD_NAME) {
         type = ChangeType::REMOVED;
-    } else if (info->Action == FILE_ACTION_MODIFIED) {
-        if (info->FileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            // Ignore MODIFIED events on directories
+    } else if (action == FILE_ACTION_MODIFIED) {
+        // Apply optimization only if attributes are safely exposed (Windows 10 path)
+        if (hasAttributes && isDirectory) {
+             // Ignore MODIFIED events on directories
             logToJava(LogLevel::TRACE_LEVEL, "Ignored MODIFIED event on directory", nullptr);
             return;
         }
         type = ChangeType::MODIFIED;
     } else {
-        logToJava(LogLevel::WARN_LEVEL, "Unknown event 0x%x for %s", info->Action, wideToUtf8String(changedPathW).c_str());
+        logToJava(LogLevel::WARN_LEVEL, "Unknown event 0x%x for %s", action, wideToUtf8String(changedPathW).c_str());
         reportUnknownEvent(env, wideToUtf16String(changedPathW));
         return;
     }
