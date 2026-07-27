@@ -4,11 +4,20 @@
 
 A cross-platform library to watch for changes on the file-system.
 
+Added Windows 7, 10, 11 Compatibility.
+
+Instructions :
+1. Run Gradle -> gradle-fileevents -> Tasks -> zig -> zigBuildx86_x64WindowsGnu to build the binary file.
+2. Copy the "gradle-fileevents.dll" file from "gradle-fileevents\build\zig\x86_64-windows-gnu\out"
+3. Replace the "gradle-fileevents.dll" file in "{RootUserDirectory}\.gradle\native\0.2.8\x86_64-windows-gnu"
+
+Enjoy running up to the latest Gradle Versions.
+
 ### Supported platforms
 
-- macOS – `x86_64` (tested on 13 and 14) and `aarch64` (untested)
+- Windows – `x86_64` (tested on Windows 7)
+- macOS – `x86_64` (tested on 13 and 14)
 - Linux – `x86_64`(tested on Ubuntu 20.04 and 24.04) and `aarch64` (untested)
-- Windows – `x86_64` (tested on Windows 2019 and 2022) and `aarch64` (untested)
 
 ## Building
 
